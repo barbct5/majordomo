@@ -1,0 +1,25 @@
+---
+log4r_config:
+  formatters:
+    - standard: &standard_formatter
+        pattern: "%d [%l][%p] [%C] %m"
+        type: PatternFormatter
+
+  loggers:
+    - name: default
+      level: INFO
+      outputters:
+        - console
+        - file
+
+  outputters:
+    - name: console
+      type: StdoutOutputter
+      level: INFO
+      formatter: *standard_formatter
+
+    - name: file
+      type: FileOutputter
+      level: DEBUG
+      filename: 'majordomo.log'
+      formatter: *standard_formatter

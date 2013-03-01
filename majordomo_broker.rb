@@ -1,84 +1,98 @@
+$: << File.expand_path('.')
+
 require 'ffi-rzmq'
-load 'mdp.rb'
+
+require 'delegate'
+require 'socket'
+
+require 'mdp'
+require 'loggable'
+require 'majordomo_broker/message_listener'
+require 'majordomo_broker/worker_handler'
+require 'majordomo_broker/addressable_message'
+require 'majordomo_broker/worker'
+require 'majordomo_broker/service'
 
 class MajorDomoBroker
+  include Loggable
 
   HEARTBEAT_INTERVAL = 2500
   HEARTBEAT_LIVELINESS = 3
   HEARTBEAT_EXPIRY = HEARTBEAT_INTERVAL * HEARTBEAT_LIVELINESS
-  INTERNAL_SERVICE_PREFIX = 'mmi.'
 
-  def initialize
+  def initialize(address)
 
     @context = ZMQ::Context.new
 
     # Configure Sockets
     @socket = @context.socket(ZMQ::ROUTER)
     @socket.setsockopt(ZMQ::LINGER, 0)
+    @socket.setsockopt(ZMQ::IDENTITY, "#{Socket.gethostname}:#{Process.pid}")
+    @socket.setsockopt(ZMQ::ROUTER_BEHAVIOR, 1)
 
     # Configure Poller
     @poller = ZMQ::Poller.new
     @poller.register(@socket, ZMQ::POLLIN)
 
     # Set next heartbeat
-    @heartbeat_at = Time.now + 0.001 * HEARTBEAT_INTERVAL
+    @heartbeat_at = Time.now + (0.001 * HEARTBEAT_INTERVAL)
 
-    Signal.trap("INT") do
-      $stdout.write("Shutting down...\n")
-      @socket.close
-      @context.terminate
-      exit
-    end
-  end
+    @socket.bind(address)
 
-  # Bind broker to endpoint. Can call this multiple times.
-  # We use a single socket for both clients and workers
-  #
-  # @param [ String ] endpoint A String representation of a ZMQ endpoint
-  def bind(endpoint)
-    @socket.bind(endpoint)
-    self
+    register_signals
   end
 
   def mediate
     loop do
       items = @poller.poll(HEARTBEAT_INTERVAL)
       if items > 0
-        message = []
-        @socket.recv_strings(message)
+        raw = []
+        @socket.recv_strings(raw)
 
-        $stdout.write("Full message: #{message}\n")
-
-        address = message.shift
-        message.shift
-        header = message.shift
+        address = raw.shift
+        header = raw[1]
 
         case header
         when MDP::C_CLIENT
-          process_client(address, message)
+          message = MDP::ClientMessage.unpack(raw)
+          process_client(AddressableMessage.new(address, message))
         when MDP::W_WORKER
-          process_worker(address, message)
+          message = MDP::WorkerMessageParser.unpack(raw)
+          process_worker(AddressableMessage.new(address, message))
         else
-          $stdout.write("E: invalid messages: #{message.inspect}\n")
+          logger.warn("Received invalid message: #{raw.inspect}")
         end
       end
 
-      if Time.now > @heartbeat_at
-        waiting.each do |worker|
-          if Time.now > worker.expiry
-            delete_worker(worker)
-          else
-            send_to_worker(worker, MDP::W_HEARTBEAT)
-          end
-        end
+      heartbeat!
+    end
+  end
 
-        puts "Workers: #{workers.count}"
+  def heartbeat!
+    if Time.now > @heartbeat_at
+      handle_waiting_workers!
 
-        services.each do |service, object|
-          $stdout.write "Service: #{service}: requests: #{object.requests.count} waiting: #{object.waiting.count}\n"
-        end
+      logger.debug("Workers: #{workers.count}")
 
-        @heartbeat_at = Time.now + 0.001 * HEARTBEAT_INTERVAL
+      services.each do |service, object|
+        logger.debug "Service: #{service} " + \
+                     "Requests: #{object.requests.count} " + \
+                     "Waiting: #{object.waiting.count}"
+      end
+
+      @heartbeat_at = Time.now + (0.001 * HEARTBEAT_INTERVAL)
+    else
+      logger.debug("Next heartbeat at #{@heartbeat_at}")
+    end
+  end
+
+  def handle_waiting_workers!
+    waiting.each do |worker|
+      if Time.now > worker.expiry
+        logger.debug("Worker expired. Deleting worker...")
+        delete_worker(worker)
+      else
+        send_to_worker(worker, MDP::HeartbeatMessage.new)
       end
     end
   end
@@ -90,9 +104,9 @@ class MajorDomoBroker
   #
   # @return [ Worker ] The deleted worker
   def delete_worker(worker, disconnect = false)
-    puts "delete_worker: #{worker.address.inspect} disconnect: #{disconnect}"
+    logger.info("Deleting worker: #{worker.address.inspect} Disconnect: #{disconnect}")
 
-    send_to_worker(worker, MDP::W_DISCONNECT) if disconnect
+    send_to_worker(worker, MDP::DisconnectMessage.new) if disconnect
 
     worker.service.waiting.delete(worker) if worker.service
     waiting.delete(worker)
@@ -102,79 +116,69 @@ class MajorDomoBroker
   # Build and send a message to a worker
   #
   # @param [ Worker ] worker
-  # @param [ String ] command
-  # @param [ Object ] option
-  # @param [ Array ] message
-  def send_to_worker(worker, command, option = nil, message = [])
-    message = [ message ] unless message.is_a?(Array)
-
-    message.unshift(option) if option
-    message.unshift(command)
-    message.unshift(MDP::W_WORKER)
-    message.unshift('')
-    message.unshift(worker.address)
-
-    @socket.send_strings(message)
+  # @param [ Message ] message
+  def send_to_worker(worker, message)
+    raw = message.pack
+    raw.unshift worker.address
+    logger.debug("Sending to Worker: #{raw.inspect}")
+    @socket.send_strings(raw)
+    logger.error "#{ZMQ::Util.error_string} (#{ZMQ::Util.errno})\t#{raw}" if ZMQ::Util.errno == 113
   end
 
   # Process a message from a client
   #
-  # @param [ Address ] address
-  # @param [ Array ] message
-  def process_client(address, message)
-    service = message.shift
-    message.unshift('')
-    message.unshift(address)
-
-    if service.start_with?(INTERNAL_SERVICE_PREFIX)
-      service_internal(service, message)
+  # @param [ AddressableMessage ] message
+  def process_client(message)
+    logger.debug("Recevied message from client #{message.address}: #{message.pack}")
+    if message.internal_service?
+      service_internal(message)
     else
-      dispatch(require_service(service), message)
+      service = require_service(message.service)
+      dispatch(service, message)
     end
   end
 
   # Handle an internal service request
-  def service_internal(service, message)
+  def service_internal(message)
     code = '501'
-    if service == 'mmi.service'
-      code = services.key?(message.last) ? '200' : '404'
+    if message.service == 'mmi.service'
+      code = services.key?(message.body) ? '200' : '404'
     end
 
-    message.insert(2, [ MDP::C_CLIENT, service ])
-    message[-2] = code
-    message.flatten!
+    message = MDP::ClientMessage.new(message.address, message.service, code)
 
-    @socket.send_strings(message)
+    @socket.send_strings(message.pack)
   end
 
-  def process_worker(address, message)
-    $stderr.write("Received message: #{message}\n")
-    command = message.shift
+  # Process a message sent from a +MajordomoWorker+
+  #
+  # @param [ AddressableMessage ] message
+  def process_worker(message)
+    logger.debug("Received message from worker #{message.address}: #{message.pack}")
+    worker_exists = workers[message.address]
+    worker = require_worker(message.address)
 
-    worker_exists = workers[address]
-    worker = require_worker(address)
-
-    case command
+    case message.command
     when MDP::W_REPLY
       if worker_exists
-        client = message.shift
-        message.shift
-        message = [ client, '', MDP::C_CLIENT, worker.service.name ].concat(message)
-
-        @socket.send_strings(message)
-
+        raw = MDP::ClientMessage.new(worker.service.name, message.body).pack
+        raw.unshift(message.client_address)
+        logger.debug("Sending message to client #{message.client_address}: #{raw}")
+        @socket.send_strings(raw)
+        logger.error "#{ZMQ::Util.error_string} (#{ZMQ::Util.errno})\t#{raw}" unless ZMQ::Util.errno == 0
         worker_waiting(worker)
       else
         delete_worker(worker)
       end
     when MDP::W_READY
-      service = message.shift
+      service = message.service
 
-      if worker_exists || service.start_with?(INTERNAL_SERVICE_PREFIX)
+      if worker_exists || service.start_with?(MDP::INTERNAL_SERVICE_PREFIX)
         delete_worker(worker, true)
       else
         worker.service = require_service(service)
         worker_waiting(worker)
+        logger.info("Worker added: #{worker.address.inspect}")
       end
     when MDP::W_HEARTBEAT
       if worker_exists
@@ -185,10 +189,14 @@ class MajorDomoBroker
     when MDP::W_DISCONNECT
       delete_worker(worker)
     else
-      $stdout.write("E: invalid message: #{message.inspect}")
+      logger.warn("Invalid message: #{message.inspect}")
     end
   end
 
+  # Dispatch outstanding messages to their destination
+  #
+  # @param [ Service ] service
+  # @param [ Message ] message
   def dispatch(service, message)
     service.requests << message if message
 
@@ -197,7 +205,7 @@ class MajorDomoBroker
       worker = service.waiting.shift
       waiting.delete(worker)
 
-      send_to_worker(worker, MDP::W_REQUEST, nil, message)
+      send_to_worker(worker, MDP::RequestMessage.new(message.address, message.body))
     end
   end
 
@@ -217,24 +225,21 @@ class MajorDomoBroker
     dispatch(worker.service, nil)
   end
 
-  class Worker
-    attr_accessor :service, :expiry, :address
-    def initialize(address, lifetime)
-      @address = address
-      @expiry = Time.now + 0.001 * lifetime
-    end
-  end
-
-  class Service
-    attr_accessor :requests, :waiting, :name
-    def initialize(name)
-      @name = name
-      @requests = []
-      @waiting = []
-    end
-  end
-
   private
+
+  def shutdown!(signal = nil)
+    $stdout.write("Shutting down...")
+    @poller.deregister_readable(@socket)
+    @socket.close
+    @context.terminate
+    exit
+  end
+
+  def register_signals
+    [ "INT", "TERM", "QUIT"].map do |signal|
+      Signal.trap(signal, &method(:shutdown!))
+    end
+  end
 
   def waiting
     @waiting ||= []
@@ -244,13 +249,16 @@ class MajorDomoBroker
     @workers ||= {}
   end
 
+  def unroutable_messages
+    @unroutable_message ||= {}
+  end
+
   def services
     @services ||= {}
   end
 end
 
 if __FILE__ == $0
-  broker = MajorDomoBroker.new
-  broker.bind("tcp://*:5555")
+  broker = MajorDomoBroker.new("tcp://*:5555")
   broker.mediate
 end

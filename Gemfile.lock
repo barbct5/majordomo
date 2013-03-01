@@ -4,9 +4,11 @@ GEM
     ffi (1.4.0)
     ffi-rzmq (1.0.0)
       ffi
+    log4r (1.1.10)
 
 PLATFORMS
   ruby
 
 DEPENDENCIES
   ffi-rzmq
+  log4r

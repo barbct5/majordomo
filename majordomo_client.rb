@@ -1,7 +1,14 @@
+$: << File.expand_path('.')
+
 require 'ffi-rzmq'
-load 'mdp.rb'
+
+require 'socket'
+
+require 'mdp'
+require 'loggable'
 
 class MajorDomoClient
+  include Loggable
 
   def initialize(broker)
     @broker = broker
@@ -14,46 +21,46 @@ class MajorDomoClient
     @timeout = 2500
 
     reconnect_to_broker
+
+    Signal.trap("INT") do
+      $stdout.write("Shutting down...\n")
+      @client.close
+      @context.terminate
+      exit
+    end
   end
 
   def reconnect_to_broker
+    logger.info("Connecting to Broker...")
     if @client
       @poller.deregister(@client)
       @client.close
     end
 
-    @client = @context.socket(ZMQ::REQ)
+    @client = @context.socket(ZMQ::DEALER)
     @client.setsockopt(ZMQ::LINGER, 0)
+    @client.setsockopt(ZMQ::IDENTITY, "#{Socket.gethostname}:#{Process.pid}")
     @client.connect(@broker)
 
     @poller.register(@client, ZMQ::POLLIN)
   end
 
   def send(service, request)
-    request = [ request ] unless request.is_a?(Array)
-    request = [ MDP::C_CLIENT, service ].concat(request)
+    message = MDP::ClientMessage.new(service, request)
+    logger.debug("Sending Message: #{message.inspect}")
 
-    retries = @retries
+    @client.send_strings message.pack
+  end
 
-    while retries > 0
-      @client.send_multipart(request)
-      items = @poller.poll(@timeout)
+  def receive
+    items = @poller.poll(@timeout)
+    if items > 0
+      raw = []
+      @client.recv_strings raw
 
-      reply = nil
-
-      if items
-        message = @client.recv_multipart
-        header = message.shift
-        reply_service  = message.shift
-
-        reply = message
-        break
-      else
-        retries ? reconnect_to_broker : break
-        retries -= 1
-      end
-
-      reply
+      MDP::ClientMessage.unpack(raw).body
+    else
+      nil # No available messages
     end
   end
 
@@ -63,14 +70,19 @@ class MajorDomoClient
 end
 
 if __FILE__ == $0
+
   client = MajorDomoClient.new("tcp://localhost:5555")
-  (0..100000).each do
+  requests = 10
+  requests.times do
     request = "Hello world"
-    reply = client.send("echo", request)
-    if reply
-      puts "Received reply: #{reply}"
-    else
-      puts "No reply receive"
-    end
+    client.send("echo", request)
+  end
+
+  exit
+  count = 0
+  while count < requests do
+    reply = client.receive
+    $stdout.write("#{reply}\n")
+    count += 1 unless reply.nil?
   end
 end
